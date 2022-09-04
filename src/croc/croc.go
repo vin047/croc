@@ -2,9 +2,11 @@ package croc
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -80,6 +82,8 @@ type Options struct {
 
 // Client holds the state of the croc transfer
 type Client struct {
+	// Context object can be assigned with a cancellable context to signal the transfer to abort
+	Context		     				context.Context
 	Options                         Options
 	Pake                            *pake.Pake
 	Key                             []byte
@@ -122,8 +126,6 @@ type Client struct {
 
 	mutex                    *sync.Mutex
 	fread                    *os.File
-	numfinished              int
-	quit                     chan bool
 	finishedNum              int
 	numberOfTransferredFiles int
 }
@@ -191,7 +193,7 @@ func New(ops Options) (c *Client, err error) {
 		upload := c.Options.ThrottleUpload[:len(c.Options.ThrottleUpload)-1]
 		uploadLimit, err := strconv.ParseInt(upload, 10, 64)
 		if err != nil {
-			panic("Could not parse given Upload Limit")
+			return nil, errors.New("could not parse given Upload Limit")
 		}
 		minBurstSize := models.TCP_BUFFER_SIZE
 		var rt rate.Limit
@@ -205,7 +207,7 @@ func New(ops Options) (c *Client, err error) {
 		default:
 			uploadLimit, err = strconv.ParseInt(c.Options.ThrottleUpload, 10, 64)
 			if err != nil {
-				panic("Could not parse given Upload Limit")
+				return nil, errors.New("could not parse given Upload Limit")
 			}
 		}
 		// Somehow 4* is neccessary
@@ -226,6 +228,7 @@ func New(ops Options) (c *Client, err error) {
 	}
 
 	c.mutex = &sync.Mutex{}
+	c.Context = context.Background()
 	return
 }
 
@@ -585,7 +588,16 @@ func (c *Client) Send(filesInfo []FileInfo, emptyFoldersToTransfer []FileInfo, t
 			}
 			log.Debugf("banner: %s", banner)
 			log.Debugf("connection established: %+v", conn)
+
+			// pings the relay until the relay has established a secure connection between
+			// us and the receiver.
+			// the connection is not saved to Client object until after this loop has exited.
 			for {
+				if c.Context.Err() != nil {
+					conn.Close()
+					errchan<- c.Context.Err()
+					return
+				}
 				log.Debug("waiting for bytes")
 				data, errConn := conn.Receive()
 				if errConn != nil {
@@ -616,6 +628,7 @@ func (c *Client) Send(filesInfo []FileInfo, emptyFoldersToTransfer []FileInfo, t
 				} else {
 					log.Debugf("[%+v] got weird bytes: %+v", conn, data)
 					// throttle the reading
+					conn.Close()
 					errchan <- fmt.Errorf("gracefully refusing using the public relay")
 					return
 				}
@@ -633,6 +646,15 @@ func (c *Client) Send(filesInfo []FileInfo, emptyFoldersToTransfer []FileInfo, t
 		}()
 	}
 
+	defer func ()  {
+		for _, conn := range c.conn {
+			if conn != nil {
+				conn.Close()
+			}
+		}
+	}()
+
+	// main blocking point for Send
 	err = <-errchan
 	if err == nil {
 		// return if no error
@@ -859,9 +881,6 @@ func (c *Client) Receive() (err error) {
 func (c *Client) transfer() (err error) {
 	// connect to the server
 
-	// quit with c.quit <- true
-	c.quit = make(chan bool)
-
 	// if recipient, initialize with sending pake information
 	log.Debug("ready")
 	if !c.Options.IsSender && !c.Step1ChannelSecured {
@@ -875,27 +894,49 @@ func (c *Client) transfer() (err error) {
 		}
 	}
 
+	listener := make(chan error, 1)
+	errchan := make(chan error)
+	// report error from listener loop or cancel event, whichever comes first
+	go func (downstream <-chan error, upstream chan<- error, )  {
+		select {
+		case <-c.Context.Done():
+			c.conn[0].Close()	// unblocks the listener loop below
+			upstream<- c.Context.Err()
+		case err := <-downstream:
+			upstream<- err
+		}
+	}(listener, errchan)
+
 	// listen for incoming messages and process them
-	for {
-		var data []byte
-		var done bool
-		data, err = c.conn[0].Receive()
-		if err != nil {
-			log.Debugf("got error receiving: %v", err)
-			if !c.Step1ChannelSecured {
-				err = fmt.Errorf("could not secure channel")
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func (errchan chan<- error)  {
+		defer wg.Done()
+		for {
+			data, err := c.conn[0].Receive()
+			if err != nil {
+				log.Debugf("got error receiving: %v", err)
+				if !c.Step1ChannelSecured {
+					err = fmt.Errorf("could not secure channel")
+				}
+				errchan<- err
+				break
 			}
-			break
+			done, err := c.processMessage(data)
+			if err != nil {
+				log.Debugf("got error processing: %v", err)
+				errchan<- err
+				break
+			}
+			if done {
+				break
+			}
 		}
-		done, err = c.processMessage(data)
-		if err != nil {
-			log.Debugf("got error processing: %v", err)
-			break
-		}
-		if done {
-			break
-		}
-	}
+	}(listener)
+	wg.Wait()
+	close(listener)
+	err = <-errchan	// error will be either from listener loop or cancellation event
+
 	// purge errors that come from successful transfer
 	if c.SuccessfulTransfer {
 		if err != nil {
@@ -1145,40 +1186,63 @@ func (c *Client) processMessagePake(m message.Message) (err error) {
 	}
 	log.Debugf("generated key = %+x with salt %x", c.Key, salt)
 
+	workerchan := make(chan error, len(c.Options.RelayPorts))
+	errchan := make(chan error)
+	// report the first error that occurs when connecting to the other ports of the server
+	go func (downstream <-chan error, upstream chan<- error) {
+		err := <-downstream
+		upstream<- err
+	}(workerchan, errchan)
+
 	// connects to the other ports of the server for transfer
 	var wg sync.WaitGroup
 	wg.Add(len(c.Options.RelayPorts))
 	for i := 0; i < len(c.Options.RelayPorts); i++ {
 		log.Debugf("port: [%s]", c.Options.RelayPorts[i])
-		go func(j int) {
+		go func(j int, worker chan<- error) {
 			defer wg.Done()
 			var host string
+			var err error
 			if c.Options.RelayAddress == "localhost" {
 				host = c.Options.RelayAddress
 			} else {
 				host, _, err = net.SplitHostPort(c.Options.RelayAddress)
 				if err != nil {
 					log.Errorf("bad relay address %s", c.Options.RelayAddress)
+					worker<- err
 					return
 				}
 			}
 			server := net.JoinHostPort(host, c.Options.RelayPorts[j])
 			log.Debugf("connecting to %s", server)
+			// as we are assigning connections here and the slice is not thread safe,
+			// there is no point closing connections on context error. so instead we
+			// just cancel any downstream workers and report the error back upstream.
+			// upstream will handle connection closing.
 			c.conn[j+1], _, _, err = tcp.ConnectToTCPServer(
 				server,
 				c.Options.RelayPassword,
 				fmt.Sprintf("%s-%d", utils.SHA256(c.Options.SharedSecret[:5])[:6], j),
 			)
 			if err != nil {
-				panic(err)
+				worker<- err
+				return
 			}
 			log.Debugf("connected to %s", server)
 			if !c.Options.IsSender {
+				// TODO: pass down workerchan and context object to receiveData function
+				// to provide a channel to report errors back to and to make it aware of
+				// errors from parallel goroutines or from cancel event
 				go c.receiveData(j)
 			}
-		}(i)
+		}(i, workerchan)
 	}
 	wg.Wait()
+	close(workerchan)
+	err = <-errchan
+	if err != nil {
+		return err
+	}
 
 	if !c.Options.IsSender {
 		log.Debug("sending external IP")
@@ -1590,6 +1654,11 @@ func (c *Client) updateState() (err error) {
 		return
 	}
 
+	// query for cancellation event just before starting the transfer
+	if c.Context.Err() != nil {
+		return c.Context.Err()
+	}
+
 	if c.Options.IsSender && c.Step3RecipientRequestFile && !c.Step4FileTransferred {
 		log.Debug("start sending data!")
 
@@ -1632,14 +1701,10 @@ func (c *Client) updateState() (err error) {
 			c.FilesToTransfer[c.FilesToTransferCurrentNum].Name,
 		)
 		c.fread, err = os.Open(pathToFile)
-		c.numfinished = 0
 		if err != nil {
 			return
 		}
-		for i := 0; i < len(c.Options.RelayPorts); i++ {
-			log.Debugf("starting sending over comm %d", i)
-			go c.sendData(i)
-		}
+		return c.sendFile()
 	}
 	return
 }
@@ -1745,22 +1810,50 @@ func (c *Client) receiveData(i int) {
 	}
 }
 
-func (c *Client) sendData(i int) {
-	defer func() {
-		log.Debugf("finished with %d", i)
-		c.numfinished++
-		if c.numfinished == len(c.Options.RelayPorts) {
-			log.Debug("closing file")
-			if err := c.fread.Close(); err != nil {
-				log.Errorf("error closing file: %v", err)
-			}
-		}
-	}()
+func (c *Client) sendFile() error {
+	// inherit from client context so we can cancel workers when cancellation event is received
+	ctx, ctxCancel := context.WithCancel(c.Context)
+
+	workerchan := make(chan error, len(c.Options.RelayPorts))
+	errchan := make(chan error)
+
+	go func (downstream <-chan error, upstream chan<- error) {
+		err := <-downstream
+		ctxCancel()
+		upstream<- err
+	}(workerchan, errchan)
+
+	var wg sync.WaitGroup
+	wg.Add(len(c.Options.RelayPorts))
+	for i := 0; i < len(c.Options.RelayPorts); i++ {
+		log.Debugf("starting sending over comm %d", i)
+		go c.sendFileWorker(i, ctx, &wg, workerchan)
+	}
+	wg.Wait()
+	close(workerchan)
+
+	log.Debug("closing file")
+	if err := c.fread.Close(); err != nil {
+		log.Errorf("error closing file: %v", err)
+	}
+
+	return <-errchan
+}
+
+func (c *Client) sendFileWorker(i int, ctx context.Context, wg *sync.WaitGroup, errchan chan<- error) {
+	defer log.Debugf("finished with %d", i)
+	defer wg.Done()
 
 	var readingPos int64
 	pos := uint64(0)
 	curi := float64(0)
 	for {
+		if ctx.Err() != nil {
+			log.Debugf("ctx error report %d", i)
+			// cancellation due to error in parallel goroutine or from cancel event
+			errchan<- ctx.Err()
+			break
+		}
 		// Read file
 		data := make([]byte, models.TCP_BUFFER_SIZE/2)
 		// log.Debugf("%d trying to read", i)
@@ -1805,12 +1898,16 @@ func (c *Client) sendData(i int) {
 					)
 				}
 				if err != nil {
-					panic(err)
+					// error when compressing/encrypting data
+					errchan<- err
+					break
 				}
 
 				err = c.conn[i+1].Send(dataToSend)
 				if err != nil {
-					panic(err)
+					// error when sending data
+					errchan<- err
+					break
 				}
 				c.bar.Add(n)
 				c.TotalSent += int64(n)
@@ -1822,10 +1919,11 @@ func (c *Client) sendData(i int) {
 		pos += uint64(n)
 
 		if errRead != nil {
-			if errRead == io.EOF {
-				break
+			if errRead != io.EOF {
+				// error when reading file
+				errchan<- errRead
 			}
-			panic(errRead)
+			break
 		}
 	}
 }
