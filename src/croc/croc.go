@@ -426,31 +426,38 @@ func (c *Client) sendCollectFiles(filesInfo []FileInfo) (err error) {
 	return
 }
 
-func (c *Client) setupLocalRelay() {
+func (c *Client) setupLocalRelay(ctx context.Context, wg *sync.WaitGroup, errchan chan<- error) {
+	defer wg.Done()
 	// setup the relay locally
 	firstPort, _ := strconv.Atoi(c.Options.RelayPorts[0])
 	openPorts := utils.FindOpenPorts("localhost", firstPort, len(c.Options.RelayPorts))
 	if len(openPorts) < len(c.Options.RelayPorts) {
-		panic("not enough open ports to run local relay")
+		errchan<- errors.New("not enough open ports to run local relay")
+		return
 	}
 	for i, port := range openPorts {
 		c.Options.RelayPorts[i] = fmt.Sprint(port)
 	}
+
+	wg.Add(len(c.Options.RelayPorts))
 	for _, port := range c.Options.RelayPorts {
-		go func(portStr string) {
+		go func(wg *sync.WaitGroup, portStr string, errchan chan<- error) {
+			defer wg.Done()
 			debugString := "warn"
 			if c.Options.Debug {
 				debugString = "debug"
 			}
-			err := tcp.Run(debugString, "localhost", portStr, c.Options.RelayPassword, strings.Join(c.Options.RelayPorts[1:], ","))
+			err := tcp.Run(ctx, debugString, "localhost", portStr, c.Options.RelayPassword, strings.Join(c.Options.RelayPorts[1:], ","))
 			if err != nil {
-				panic(err)
+				errchan<- err
 			}
-		}(port)
+		}(wg, port, errchan)
 	}
 }
 
-func (c *Client) broadcastOnLocalNetwork(useipv6 bool) {
+func (c *Client) broadcastOnLocalNetwork(ctx context.Context, wg *sync.WaitGroup, useipv6 bool, done chan<- struct{}) {
+	defer close(done)
+	defer wg.Done()
 	var timeLimit time.Duration
 	//if we don't use an external relay, the broadcast messages need to be sent continuously
 	if c.Options.OnlyLocal {
@@ -460,6 +467,7 @@ func (c *Client) broadcastOnLocalNetwork(useipv6 bool) {
 	}
 	// look for peers first
 	settings := peerdiscovery.Settings{
+		Context:   ctx,
 		Limit:     -1,
 		Payload:   []byte("croc" + c.Options.RelayPorts[0]),
 		Delay:     20 * time.Millisecond,
@@ -477,7 +485,8 @@ func (c *Client) broadcastOnLocalNetwork(useipv6 bool) {
 	}
 }
 
-func (c *Client) transferOverLocalRelay(errchan chan<- error) {
+func (c *Client) transferOverLocalRelay(ctx context.Context, wg *sync.WaitGroup, connErr, tranErr chan<- error) {
+	defer wg.Done()
 	time.Sleep(500 * time.Millisecond)
 	log.Debug("establishing connection")
 	var banner string
@@ -487,10 +496,16 @@ func (c *Client) transferOverLocalRelay(errchan chan<- error) {
 		err = fmt.Errorf("could not connect to localhost:%s: %w", c.Options.RelayPorts[0], err)
 		log.Debug(err)
 		// not really an error because it will try to connect over the actual relay
+		connErr<- err
 		return
 	}
 	log.Debugf("local connection established: %+v", conn)
 	for {
+		if ctx.Err() != nil {
+			conn.Close()
+			connErr<- ctx.Err()
+			return
+		}
 		data, _ := conn.Receive()
 		if bytes.Equal(data, handshakeRequest) {
 			break
@@ -509,7 +524,7 @@ func (c *Client) transferOverLocalRelay(errchan chan<- error) {
 		c.Options.RelayPorts = []string{c.Options.RelayPorts[0]}
 	}
 	c.ExternalIP = ipaddr
-	errchan <- c.transfer()
+	tranErr<- c.transfer()
 }
 
 // Send will send the specified file
@@ -538,23 +553,40 @@ func (c *Client) Send(filesInfo []FileInfo, emptyFoldersToTransfer []FileInfo, t
 	// c.spinner.Start()
 	// create channel for quitting
 	// connect to the relay for messaging
-	errchan := make(chan error, 1)
+	var wg sync.WaitGroup
+	localCtx, localCtxCancel := context.WithCancel(c.Context)
+	remoteCtx, remoteCtxCancel := context.WithCancel(c.Context)
+
+	var localRelayErrChan chan error
+	var localBroadcastV4Chan chan struct{}
+	var localBroadcastV6Chan chan struct{}
+	var localConnErrChan chan error
+	var remoteConnErrChan chan error
+	transferErrChan := make(chan error)
 
 	if !c.Options.DisableLocal {
-		// add two things to the error channel
-		errchan = make(chan error, 2)
-		c.setupLocalRelay()
+		wg.Add(4)
+		localRelayErrChan = make(chan error, len(c.Options.RelayPorts))
+		localBroadcastV4Chan = make(chan struct{}, 1)
+		localBroadcastV6Chan = make(chan struct{}, 1)
+		localConnErrChan = make(chan error, 1)
+
+		c.setupLocalRelay(localCtx, &wg, localRelayErrChan)
 		// broadcast on ipv4
-		go c.broadcastOnLocalNetwork(false)
+		go c.broadcastOnLocalNetwork(localCtx, &wg, false, localBroadcastV4Chan)
 		// broadcast on ipv6
-		go c.broadcastOnLocalNetwork(true)
-		go c.transferOverLocalRelay(errchan)
+		go c.broadcastOnLocalNetwork(localCtx, &wg, true, localBroadcastV6Chan)
+		go c.transferOverLocalRelay(localCtx, &wg, localConnErrChan, transferErrChan)
 	}
 
 	if !c.Options.OnlyLocal {
-		go func() {
+		wg.Add(1)
+		remoteConnErrChan = make(chan error, 1)
+		go func(ctx context.Context, wg *sync.WaitGroup, connErr, tranErr chan<- error) {
+			defer wg.Done()
 			var ipaddr, banner string
 			var conn *comm.Comm
+			var err error
 			durations := []time.Duration{100 * time.Millisecond, 5 * time.Second}
 			for i, address := range []string{c.Options.RelayAddress6, c.Options.RelayAddress} {
 				if address == "" {
@@ -583,7 +615,7 @@ func (c *Client) Send(filesInfo []FileInfo, emptyFoldersToTransfer []FileInfo, t
 			if err != nil {
 				err = fmt.Errorf("could not connect to %s: %w", c.Options.RelayAddress, err)
 				log.Debug(err)
-				errchan <- err
+				connErr<- err
 				return
 			}
 			log.Debugf("banner: %s", banner)
@@ -593,9 +625,9 @@ func (c *Client) Send(filesInfo []FileInfo, emptyFoldersToTransfer []FileInfo, t
 			// us and the receiver.
 			// the connection is not saved to Client object until after this loop has exited.
 			for {
-				if c.Context.Err() != nil {
+				if ctx.Err() != nil {
 					conn.Close()
-					errchan<- c.Context.Err()
+					connErr<- ctx.Err()
 					return
 				}
 				log.Debug("waiting for bytes")
@@ -629,7 +661,7 @@ func (c *Client) Send(filesInfo []FileInfo, emptyFoldersToTransfer []FileInfo, t
 					log.Debugf("[%+v] got weird bytes: %+v", conn, data)
 					// throttle the reading
 					conn.Close()
-					errchan <- fmt.Errorf("gracefully refusing using the public relay")
+					connErr <- fmt.Errorf("gracefully refusing using the public relay")
 					return
 				}
 			}
@@ -642,8 +674,8 @@ func (c *Client) Send(filesInfo []FileInfo, emptyFoldersToTransfer []FileInfo, t
 			}
 			c.ExternalIP = ipaddr
 			log.Debug("exchanged header message")
-			errchan <- c.transfer()
-		}()
+			tranErr<- c.transfer()
+		}(remoteCtx, &wg, remoteConnErrChan, transferErrChan)
 	}
 
 	defer func ()  {
@@ -655,21 +687,29 @@ func (c *Client) Send(filesInfo []FileInfo, emptyFoldersToTransfer []FileInfo, t
 	}()
 
 	// main blocking point for Send
-	err = <-errchan
-	if err == nil {
-		// return if no error
-		return
-	} else {
-		log.Debugf("error from errchan: %v", err)
-		if strings.Contains(err.Error(), "could not secure channel") {
-			return err
+	chanListener:
+	for (localConnErrChan != nil && (localBroadcastV4Chan != nil || localBroadcastV6Chan != nil)) ||
+	remoteConnErrChan != nil {
+		select {
+		case err = <-localRelayErrChan:
+			break chanListener
+		case <-localBroadcastV4Chan:
+			localBroadcastV4Chan = nil
+		case <-localBroadcastV6Chan:
+			localBroadcastV6Chan = nil
+		case err = <-localConnErrChan:
+			localConnErrChan = nil
+		case err = <-remoteConnErrChan:
+			remoteConnErrChan = nil
+		case err = <-transferErrChan:
+			break chanListener
 		}
 	}
-	if !c.Options.DisableLocal {
-		if strings.Contains(err.Error(), "refusing files") || strings.Contains(err.Error(), "EOF") || strings.Contains(err.Error(), "bad password") {
-			errchan <- err
-		}
-		err = <-errchan
+	localCtxCancel()
+	remoteCtxCancel()
+	wg.Wait()
+	if err != nil {
+		log.Debugf("error from chan: %v", err)
 	}
 	return err
 }

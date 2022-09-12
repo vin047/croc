@@ -1,6 +1,7 @@
 package croc
 
 import (
+	"context"
 	"os"
 	"path"
 	"path/filepath"
@@ -17,11 +18,11 @@ import (
 func init() {
 	log.SetLevel("trace")
 
-	go tcp.Run("debug", "localhost", "8281", "pass123", "8282,8283,8284,8285")
-	go tcp.Run("debug", "localhost", "8282", "pass123")
-	go tcp.Run("debug", "localhost", "8283", "pass123")
-	go tcp.Run("debug", "localhost", "8284", "pass123")
-	go tcp.Run("debug", "localhost", "8285", "pass123")
+	go tcp.Run(context.Background(), "debug", "localhost", "8281", "pass123", "8282,8283,8284,8285")
+	go tcp.Run(context.Background(), "debug", "localhost", "8282", "pass123")
+	go tcp.Run(context.Background(), "debug", "localhost", "8283", "pass123")
+	go tcp.Run(context.Background(), "debug", "localhost", "8284", "pass123")
+	go tcp.Run(context.Background(), "debug", "localhost", "8285", "pass123")
 	time.Sleep(1 * time.Second)
 }
 

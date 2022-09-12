@@ -470,11 +470,11 @@ func relay(c *cli.Context) (err error) {
 			continue
 		}
 		go func(portStr string) {
-			err = tcp.Run(debugString, host, portStr, determinePass(c))
+			err = tcp.Run(c.Context, debugString, host, portStr, determinePass(c))
 			if err != nil {
 				panic(err)
 			}
 		}(port)
 	}
-	return tcp.Run(debugString, host, ports[0], determinePass(c), tcpPorts)
+	return tcp.Run(c.Context, host, ports[0], determinePass(c), tcpPorts)
 }

@@ -2,6 +2,7 @@ package tcp
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"net"
 	"strings"
@@ -17,6 +18,7 @@ import (
 )
 
 type server struct {
+	ctx 	   context.Context
 	host       string
 	port       string
 	debugLevel string
@@ -42,8 +44,9 @@ const pingRoom = "pinglkasjdlfjsaldjf"
 var timeToRoomDeletion = 10 * time.Minute
 
 // Run starts a tcp listener, run async
-func Run(debugLevel, host, port, password string, banner ...string) (err error) {
+func Run(ctx context.Context, debugLevel, host, port, password string, banner ...string) (err error) {
 	s := new(server)
+	s.ctx = ctx
 	s.host = host
 	s.port = port
 	s.password = password
@@ -61,21 +64,21 @@ func (s *server) start() (err error) {
 	s.rooms.rooms = make(map[string]roomInfo)
 	s.rooms.Unlock()
 
+	var wg sync.WaitGroup
+	wg.Add(1)
+	ctx, ctxCancel := context.WithCancel(s.ctx)
 	// delete old rooms
 	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(timeToRoomDeletion)
+		defer ticker.Stop()
 		for {
-			time.Sleep(timeToRoomDeletion)
-			var roomsToDelete []string
-			s.rooms.Lock()
-			for room := range s.rooms.rooms {
-				if time.Since(s.rooms.rooms[room].opened) > 3*time.Hour {
-					roomsToDelete = append(roomsToDelete, room)
-				}
-			}
-			s.rooms.Unlock()
-
-			for _, room := range roomsToDelete {
-				s.deleteRoom(room)
+			select {
+			case <-ticker.C:
+				s.deleteOldRooms()
+			case <-ctx.Done():
+				s.deleteOldRooms()
+				return
 			}
 		}
 	}()
@@ -84,7 +87,24 @@ func (s *server) start() (err error) {
 	if err != nil {
 		log.Error(err)
 	}
+	ctxCancel()
+	wg.Wait()
 	return
+}
+
+func (s *server) deleteOldRooms() {
+	var roomsToDelete []string
+	s.rooms.Lock()
+	for room := range s.rooms.rooms {
+		if time.Since(s.rooms.rooms[room].opened) > 3*time.Hour {
+			roomsToDelete = append(roomsToDelete, room)
+		}
+	}
+	s.rooms.Unlock()
+
+	for _, room := range roomsToDelete {
+		s.deleteRoom(room)
+	}
 }
 
 func (s *server) run() (err error) {
@@ -115,61 +135,100 @@ func (s *server) run() (err error) {
 		return fmt.Errorf("error listening on %s: %w", addr, err)
 	}
 	defer server.Close()
-	// spawn a new goroutine whenever a client connects
-	for {
-		connection, err := server.Accept()
-		if err != nil {
-			return fmt.Errorf("problem accepting connection: %w", err)
+
+	listener := make(chan error, 1)
+	errchan := make(chan error)
+	// report error from listener loop or cancel event, whichever comes first
+	go func (downstream <-chan error, upstream chan<- error, )  {
+		select {
+		case <-s.ctx.Done():
+			server.Close()	// unblocks the listener loop below
+			upstream<- s.ctx.Err()
+		case err := <-downstream:
+			upstream<- err
 		}
-		log.Debugf("client %s connected", connection.RemoteAddr().String())
-		go func(port string, connection net.Conn) {
-			c := comm.New(connection)
-			room, errCommunication := s.clientCommunication(port, c)
-			log.Debugf("room: %+v", room)
-			log.Debugf("err: %+v", errCommunication)
-			if errCommunication != nil {
-				log.Debugf("relay-%s: %s", connection.RemoteAddr().String(), errCommunication.Error())
-				connection.Close()
-				return
+	}(listener, errchan)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func (errchan chan<- error)  {
+		defer wg.Done()
+		// spawn a new goroutine whenever a client connects
+		for {
+			// at this point we don't know if this connection is from a sender or receiver
+			connection, err := server.Accept()
+			if err != nil {
+				errchan<- fmt.Errorf("problem accepting connection: %w", err)
+				break
 			}
-			if room == pingRoom {
-				log.Debugf("got ping")
-				connection.Close()
-				return
-			}
-			for {
-				// check connection
-				log.Debugf("checking connection of room %s for %+v", room, c)
-				deleteIt := false
-				s.rooms.Lock()
-				if _, ok := s.rooms.rooms[room]; !ok {
-					log.Debug("room is gone")
-					s.rooms.Unlock()
+			log.Debugf("client %s connected", connection.RemoteAddr().String())
+			wg.Add(1)
+			// remember, this function is running twice in parallel for every connection pair - 1st one from the sender and 2nd one from the receiver
+			go func(port string, connection net.Conn) {
+				defer wg.Done()
+				c := comm.New(connection)
+				// after the following call, if the room is not full, then it means that this connection is from the sender, since sender creates the room ans is always first in the room
+				room, errCommunication := s.clientCommunication(port, c)
+				log.Debugf("room: %+v", room)
+				log.Debugf("err: %+v", errCommunication)
+				if errCommunication != nil {
+					log.Debugf("relay-%s: %s", connection.RemoteAddr().String(), errCommunication.Error())
+					connection.Close()
 					return
 				}
-				log.Debugf("room: %+v", s.rooms.rooms[room])
-				if s.rooms.rooms[room].first != nil && s.rooms.rooms[room].second != nil {
-					log.Debug("rooms ready")
-					s.rooms.Unlock()
-					break
-				} else {
-					if s.rooms.rooms[room].first != nil {
-						errSend := s.rooms.rooms[room].first.Send([]byte{1})
-						if errSend != nil {
-							log.Debug(errSend)
-							deleteIt = true
+				if room == pingRoom {
+					log.Debugf("got ping")
+					connection.Close()
+					return
+				}
+				// this loop is mainly for senders, making them wait for a receiver to connect
+				for {
+					if s.ctx.Err() != nil {
+						s.deleteRoom(room)
+						return
+					}
+					// check connection
+					log.Debugf("checking connection of room %s for %+v", room, c)
+					deleteIt := false
+					s.rooms.Lock()
+					if _, ok := s.rooms.rooms[room]; !ok {
+						// if the room has gone it means the transfer has completed
+						// it also means that this connection is from a receiver, since sender would have exited via the next if condition
+						log.Debug("room is gone")
+						s.rooms.Unlock()
+						return
+					}
+					log.Debugf("room: %+v", s.rooms.rooms[room])
+					if s.rooms.rooms[room].first != nil && s.rooms.rooms[room].second != nil {
+						// only a connection initiated by sender will fall here, since the sender has been waiting for the room to be filled
+						log.Debug("rooms ready")
+						s.rooms.Unlock()
+						break
+					} else {
+						// room is not ready
+						if s.rooms.rooms[room].first != nil {
+							// sender is still in the room. verify sender is still connected
+							errSend := s.rooms.rooms[room].first.Send([]byte{1})
+							if errSend != nil {
+								// looks like the sender has gone! delete the room
+								log.Debug(errSend)
+								deleteIt = true
+							}
 						}
 					}
+					s.rooms.Unlock()
+					if deleteIt {
+						s.deleteRoom(room)
+						break
+					}
+					time.Sleep(1 * time.Second)
 				}
-				s.rooms.Unlock()
-				if deleteIt {
-					s.deleteRoom(room)
-					break
-				}
-				time.Sleep(1 * time.Second)
-			}
-		}(s.port, connection)
-	}
+			}(s.port, connection)
+		}
+	}(listener)
+	wg.Wait()
+	close(listener)
+	return <-errchan
 }
 
 var weakKey = []byte{1, 2, 3}
@@ -263,6 +322,7 @@ func (s *server) clientCommunication(port string, c *comm.Comm) (room string, er
 	s.rooms.Lock()
 	// create the room if it is new
 	if _, ok := s.rooms.rooms[room]; !ok {
+		// connection is from sender, since sender is the one who creates the room and is first to be present
 		s.rooms.rooms[room] = roomInfo{
 			first:  c,
 			opened: time.Now(),
@@ -303,6 +363,7 @@ func (s *server) clientCommunication(port string, c *comm.Comm) (room string, er
 		opened: s.rooms.rooms[room].opened,
 		full:   true,
 	}
+	// if we've reached this point it means the room is now full, indicating that the current connection is the receiver and 2nd occupant. the 1st occupant is therefore the sender
 	otherConnection := s.rooms.rooms[room].first
 	s.rooms.Unlock()
 
@@ -311,9 +372,9 @@ func (s *server) clientCommunication(port string, c *comm.Comm) (room string, er
 	wg.Add(1)
 
 	// start piping
-	go func(com1, com2 *comm.Comm, wg *sync.WaitGroup) {
+	go func(sender, receiver *comm.Comm, wg *sync.WaitGroup) {
 		log.Debug("starting pipes")
-		pipe(com1.Connection(), com2.Connection())
+		pipe(sender.Connection(), receiver.Connection())
 		wg.Done()
 		log.Debug("done piping")
 	}(otherConnection, c, &wg)
@@ -355,7 +416,7 @@ func (s *server) deleteRoom(room string) {
 
 // chanFromConn creates a channel from a Conn object, and sends everything it
 //  Read()s from the socket to the channel.
-func chanFromConn(conn net.Conn) chan []byte {
+func chanFromConn(conn net.Conn) <-chan []byte {
 	c := make(chan []byte, 1)
 	if err := conn.SetReadDeadline(time.Now().Add(3 * time.Hour)); err != nil {
 		log.Warnf("can't set read deadline: %v", err)
@@ -373,7 +434,7 @@ func chanFromConn(conn net.Conn) chan []byte {
 			}
 			if err != nil {
 				log.Debug(err)
-				c <- nil
+				close(c)
 				break
 			}
 		}
@@ -385,25 +446,31 @@ func chanFromConn(conn net.Conn) chan []byte {
 
 // pipe creates a full-duplex pipe between the two sockets and
 // transfers data from one to the other.
-func pipe(conn1 net.Conn, conn2 net.Conn) {
-	chan1 := chanFromConn(conn1)
-	chan2 := chanFromConn(conn2)
+// when one connection is closed, the other connection is
+// forcefully closed.
+func pipe(senderConn net.Conn, receiverConn net.Conn) {
+	senderChan := chanFromConn(senderConn)
+	receiverChan := chanFromConn(receiverConn)
 
-	for {
+	for senderChan != nil || receiverChan != nil {
 		select {
-		case b1 := <-chan1:
-			if b1 == nil {
-				return
+		case b1, open := <-senderChan:
+			if !open {
+				receiverConn.Close()
+				senderChan = nil
+				continue
 			}
-			if _, err := conn2.Write(b1); err != nil {
+			if _, err := receiverConn.Write(b1); err != nil {
 				log.Errorf("write error on channel 1: %v", err)
 			}
 
-		case b2 := <-chan2:
-			if b2 == nil {
-				return
+		case b2, open := <-receiverChan:
+			if !open {
+				senderConn.Close()
+				receiverChan = nil
+				continue
 			}
-			if _, err := conn1.Write(b2); err != nil {
+			if _, err := senderConn.Write(b2); err != nil {
 				log.Errorf("write error on channel 2: %v", err)
 			}
 		}

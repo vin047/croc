@@ -2,6 +2,7 @@ package tcp
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -12,7 +13,7 @@ import (
 
 func BenchmarkConnection(b *testing.B) {
 	log.SetLevel("trace")
-	go Run("debug", "localhost", "8283", "pass123", "8284")
+	go Run(context.Background(), "debug", "localhost", "8283", "pass123", "8284")
 	time.Sleep(100 * time.Millisecond)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -24,7 +25,7 @@ func BenchmarkConnection(b *testing.B) {
 func TestTCP(t *testing.T) {
 	log.SetLevel("error")
 	timeToRoomDeletion = 100 * time.Millisecond
-	go Run("debug", "localhost", "8381", "pass123", "8382")
+	go Run(context.Background(), "debug", "localhost", "8381", "pass123", "8382")
 	time.Sleep(timeToRoomDeletion)
 	err := PingServer("localhost:8381")
 	assert.Nil(t, err)
