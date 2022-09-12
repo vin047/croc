@@ -80,11 +80,25 @@ type Options struct {
 	ZipFolder      bool
 }
 
+// Handlers holds the callbacks to run as the transfer progresses
+type Handlers struct {
+	TransferStarted  func()
+	TransferProgress func(
+		fileHash []byte,
+		fileSize,
+		bytesTransferred,
+		msElapsed,
+		totalBytesTransferred,
+		totalMsElapsed int64)
+	TransferComplete func(error)
+}
+
 // Client holds the state of the croc transfer
 type Client struct {
 	// Context object can be assigned with a cancellable context to signal the transfer to abort
 	Context		     				context.Context
 	Options                         Options
+	Handlers						Handlers
 	Pake                            *pake.Pake
 	Key                             []byte
 	ExternalIP, ExternalIPConnected string
@@ -710,6 +724,9 @@ func (c *Client) Send(filesInfo []FileInfo, emptyFoldersToTransfer []FileInfo, t
 	wg.Wait()
 	if err != nil {
 		log.Debugf("error from chan: %v", err)
+	}
+	if c.Handlers.TransferComplete != nil {
+		go c.Handlers.TransferComplete(err)
 	}
 	return err
 }
@@ -1705,6 +1722,9 @@ func (c *Client) updateState() (err error) {
 		if !c.firstSend {
 			fmt.Fprintf(os.Stderr, "\nSending (->%s)\n", c.ExternalIPConnected)
 			c.firstSend = true
+			if c.Handlers.TransferStarted != nil {
+				go c.Handlers.TransferStarted()
+			}
 			// if there are empty files, show them as already have been transferred now
 			for i := range c.FilesToTransfer {
 				if c.FilesToTransfer[i].Size == 0 {
@@ -1863,14 +1883,54 @@ func (c *Client) sendFile() error {
 		upstream<- err
 	}(workerchan, errchan)
 
+	progresschan := make(chan int)
+	go func ()  {
+		fileSize := c.FilesToTransfer[c.FilesToTransferCurrentNum].Size
+		fileHash := c.FilesToTransfer[c.FilesToTransferCurrentNum].Hash
+		fileTransferStart := time.Now()
+
+		interval := time.Now()
+		var intervalBytes int64
+		for {
+			bytes, open := <-progresschan
+			if !open {
+				break
+			}
+			c.bar.Add(bytes)
+			c.TotalSent += int64(bytes)
+			intervalBytes += int64(bytes)
+
+			elapsed := time.Since(interval)
+			// report progress only after 100ms have passed since last interval or if transfer is complete
+			// EOF may also send 0 bytes to the progress channel, which we ignore
+			if (elapsed < time.Millisecond * 100 && c.TotalSent < fileSize) || intervalBytes == 0 {
+				continue
+			}
+
+			totalElapsed := time.Since(fileTransferStart)
+			if c.Handlers.TransferProgress != nil {
+				go c.Handlers.TransferProgress(
+					fileHash,
+					fileSize,
+					intervalBytes,
+					elapsed.Milliseconds(),
+					c.TotalSent,
+					totalElapsed.Milliseconds())
+			}
+			interval = time.Now()
+			intervalBytes = 0
+		}
+	}()
+
 	var wg sync.WaitGroup
 	wg.Add(len(c.Options.RelayPorts))
 	for i := 0; i < len(c.Options.RelayPorts); i++ {
 		log.Debugf("starting sending over comm %d", i)
-		go c.sendFileWorker(i, ctx, &wg, workerchan)
+		go c.sendFileWorker(i, ctx, &wg, progresschan, workerchan)
 	}
 	wg.Wait()
 	close(workerchan)
+	close(progresschan)
 
 	log.Debug("closing file")
 	if err := c.fread.Close(); err != nil {
@@ -1880,7 +1940,7 @@ func (c *Client) sendFile() error {
 	return <-errchan
 }
 
-func (c *Client) sendFileWorker(i int, ctx context.Context, wg *sync.WaitGroup, errchan chan<- error) {
+func (c *Client) sendFileWorker(i int, ctx context.Context, wg *sync.WaitGroup, progresschan chan<- int, errchan chan<- error) {
 	defer log.Debugf("finished with %d", i)
 	defer wg.Done()
 
@@ -1949,8 +2009,7 @@ func (c *Client) sendFileWorker(i int, ctx context.Context, wg *sync.WaitGroup, 
 					errchan<- err
 					break
 				}
-				c.bar.Add(n)
-				c.TotalSent += int64(n)
+				progresschan<- n
 				// time.Sleep(100 * time.Millisecond)
 			}
 		}
