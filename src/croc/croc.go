@@ -82,15 +82,13 @@ type Options struct {
 
 // Handlers holds the callbacks to run as the transfer progresses
 type Handlers struct {
-	TransferStarted  func()
-	TransferProgress func(
-		fileHash []byte,
+	TransferStarted  	func()
+	TransferProgress	func(
 		fileSize,
 		bytesTransferred,
 		msElapsed,
 		totalBytesTransferred,
 		totalMsElapsed int64)
-	TransferComplete func(error)
 }
 
 // Client holds the state of the croc transfer
@@ -724,9 +722,6 @@ func (c *Client) Send(filesInfo []FileInfo, emptyFoldersToTransfer []FileInfo, t
 	wg.Wait()
 	if err != nil {
 		log.Debugf("error from chan: %v", err)
-	}
-	if c.Handlers.TransferComplete != nil {
-		go c.Handlers.TransferComplete(err)
 	}
 	return err
 }
@@ -1886,7 +1881,6 @@ func (c *Client) sendFile() error {
 	progresschan := make(chan int)
 	go func ()  {
 		fileSize := c.FilesToTransfer[c.FilesToTransferCurrentNum].Size
-		fileHash := c.FilesToTransfer[c.FilesToTransferCurrentNum].Hash
 		fileTransferStart := time.Now()
 
 		interval := time.Now()
@@ -1910,7 +1904,6 @@ func (c *Client) sendFile() error {
 			totalElapsed := time.Since(fileTransferStart)
 			if c.Handlers.TransferProgress != nil {
 				go c.Handlers.TransferProgress(
-					fileHash,
 					fileSize,
 					intervalBytes,
 					elapsed.Milliseconds(),
